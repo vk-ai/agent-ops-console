@@ -45,7 +45,7 @@ jobs:
     env:
       # Edit-args approvals live in vk-ai/agent-runtime-gcp#1 (branch feat/edit-args-approval).
       # Switch this back to "main" once that PR is merged.
-      RUNTIME_REF: feat/edit-args-approval
+      RUNTIME_REF: main
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
