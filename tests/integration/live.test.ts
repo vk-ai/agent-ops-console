@@ -2,6 +2,7 @@
  * Live checks against the real backends. Skipped unless the env vars are set:
  *
  *   AGENT_RUNTIME_URL=http://127.0.0.1:8100 AGENT_RUNTIME_APPROVER_TOKEN=dev-approver
+ *   REVIEWER_TOKEN=tok-integration                (runtime started with AGENTRT_REVIEWER_TOKENS={"tok-integration":"integration-bot"})
  *   MCP_HUB_URL=http://127.0.0.1:8200            (hub in sandbox mode, dev API keys)
  *
  * See scripts/integration.sh, which starts both from pip installs and runs this file.
@@ -19,6 +20,7 @@ import type { Policy } from "@/lib/types";
 const RT = process.env.AGENT_RUNTIME_URL;
 const TOKEN = process.env.AGENT_RUNTIME_APPROVER_TOKEN;
 const HUB = process.env.MCP_HUB_URL;
+const REVIEWER_TOKEN = process.env.REVIEWER_TOKEN;
 const uniq = () => `it-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
 describe.skipIf(!RT)("agent-runtime-gcp (live)", () => {
@@ -51,6 +53,27 @@ describe.skipIf(!RT)("agent-runtime-gcp (live)", () => {
     const noToken = new HttpRuntime(RT!, undefined);
     await expect(noToken.decide(run.run_id, { approved: true, reviewer: "x" })).rejects.toMatchObject({ status: 401 });
     expect((await rt.decide(run.run_id, { approved: false, reviewer: "integration" })).status).toBe("rejected");
+  });
+
+  it("edit-args approval: bound to pending_id + digest, single use, per-reviewer token, decision log", async () => {
+    const run = await rt.startRun({ user_id: uniq(), task: "Deploy build 9 to prod" });
+    const pd = run.pending_decision;
+    expect(pd, "runtime without edit-args approvals (needs vk-ai/agent-runtime-gcp#1)").toBeTruthy();
+    expect(pd!.args).toEqual({ target: "build 9 to prod" });
+    const mock = await new MockRuntime().startRun({ user_id: run.user_id, task: run.task, run_id: run.run_id });
+    expect(mock.pending_decision!.args_digest).toBe(pd!.args_digest);
+    await expect(rt.decide(run.run_id, { decision: "approve", reviewer: "x", args_digest: "sha256:stale" })).rejects.toMatchObject({ status: 409 });
+    await expect(rt.decide(run.run_id, { decision: "edit", reviewer: "x", edited_args: { extra: "no" } })).rejects.toMatchObject({ status: 422 });
+    const body = { decision: "edit" as const, pending_id: pd!.pending_id, args_digest: pd!.args_digest, edited_args: { target: "build 9 to staging" } };
+    const done = REVIEWER_TOKEN ? await rt.decide(run.run_id, body, REVIEWER_TOKEN) : await rt.decide(run.run_id, { ...body, reviewer: "integration" });
+    expect(done.status).toBe("succeeded");
+    expect(done.action?.args).toEqual({ target: "build 9 to staging" });
+    expect(done.approval?.decision).toBe("edit");
+    if (REVIEWER_TOKEN) expect(done.approval?.reviewer).toBe("integration-bot");
+    await expect(rt.decide(run.run_id, body, REVIEWER_TOKEN)).rejects.toMatchObject({ status: 409 });
+    const log = await rt.decisions(run.run_id);
+    expect(log).toMatchObject([{ decision: "edited", edited_args: { target: "build 9 to staging" }, original_args: { target: "build 9 to prod" } }]);
+    expect((await rt.decisions()).some((d) => d.run_id === run.run_id)).toBe(true);
   });
 
   it("returns 404 for unknown runs", async () => {

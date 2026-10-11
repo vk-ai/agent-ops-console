@@ -42,6 +42,10 @@ jobs:
   integration:
     name: live integration (agent-runtime-gcp + mcp-integration-hub)
     runs-on: ubuntu-latest
+    env:
+      # Edit-args approvals live in vk-ai/agent-runtime-gcp#1 (branch feat/edit-args-approval).
+      # Switch this back to "main" once that PR is merged.
+      RUNTIME_REF: main
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -54,7 +58,7 @@ jobs:
       - run: npm ci
       - name: Install the two backends from their public repos
         run: |
-          python -m venv /tmp/rt && /tmp/rt/bin/pip install -q "agent-runtime-gcp @ git+https://github.com/vk-ai/agent-runtime-gcp"
+          python -m venv /tmp/rt && /tmp/rt/bin/pip install -q "agent-runtime-gcp @ git+https://github.com/vk-ai/agent-runtime-gcp@${RUNTIME_REF}"
           python -m venv /tmp/hub && /tmp/hub/bin/pip install -q "mcp-integration-hub @ git+https://github.com/vk-ai/mcp-integration-hub"
       - name: Start both and run the live tests
         env:

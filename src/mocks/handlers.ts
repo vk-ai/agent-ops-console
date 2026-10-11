@@ -50,7 +50,12 @@ export function handlers(m: MockApi) {
     http.get(p("/api/runtime/runs/:id"), ({ params }) => wrap(() => m.runtime.getRun(String(params.id)))),
     http.post(p("/api/runtime/runs/:id/decision"), async ({ params, request }) => {
       const body = (await request.json()) as DecisionRequest;
-      return wrap(() => m.runtime.decide(String(params.id), body));
+      const token = request.headers.get("x-reviewer-token") ?? undefined;
+      return wrap(() => m.runtime.decide(String(params.id), body, token));
+    }),
+    http.get(p("/api/runtime/decisions"), ({ request }) => {
+      const runId = new URL(request.url).searchParams.get("run_id") ?? undefined;
+      return wrap(() => m.runtime.decisions(runId));
     }),
     http.post(p("/api/runtime/runs/:id/resume"), ({ params }) => wrap(() => m.runtime.resume(String(params.id)))),
     http.get(p("/api/runtime/users/:user/memories"), ({ params }) =>

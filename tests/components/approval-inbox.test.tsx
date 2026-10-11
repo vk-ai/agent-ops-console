@@ -2,12 +2,22 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { ApprovalInbox } from "@/components/ApprovalInbox";
+import { MockRuntime } from "@/lib/server/mock-runtime";
 import { mockServer, renderWithRuns } from "./helpers";
 
 const ctx = await mockServer();
 beforeAll(() => ctx.server.listen({ onUnhandledFrame: "error" }));
-afterEach(() => localStorage.clear());
+afterEach(() => {
+  localStorage.clear();
+  sessionStorage.clear();
+});
 afterAll(() => ctx.server.close());
+
+async function freshRuntime(opts: ConstructorParameters<typeof MockRuntime>[0] = {}) {
+  const rt = new MockRuntime(opts);
+  await rt.seed();
+  ctx.api.runtime = rt;
+}
 
 describe("ApprovalInbox", () => {
   it("lists runs waiting at human_approval with their proposed action", async () => {
@@ -44,7 +54,8 @@ describe("ApprovalInbox", () => {
     const runs = await ctx.api.runtime.listRuns();
     const refundRun = runs.find((r) => r.task.startsWith("Refund"))!;
     const view = await ctx.api.runtime.getRun(refundRun.run_id);
-    expect(view.approval).toEqual({ approved: true, reviewer: "vinay", comment: "duplicate confirmed" });
+    expect(view.approval).toMatchObject({ approved: true, reviewer: "vinay", comment: "duplicate confirmed", decision: "approve" });
+    expect(view.approval?.approved_args_digest).toBe(view.approval?.original_args_digest);
     expect(view.result).toContain("simulated refund executed");
     expect(localStorage.getItem("reviewer")).toBe("vinay");
   });
@@ -60,5 +71,54 @@ describe("ApprovalInbox", () => {
     await push();
     await waitFor(() => expect(screen.queryAllByRole("article")).toHaveLength(0));
     expect(screen.getByText("No runs are waiting for approval.")).toBeInTheDocument();
+  });
+
+  it("edits an argument, approves with edits, and shows it in the decision log", async () => {
+    await freshRuntime();
+    await renderWithRuns(<ApprovalInbox />, ctx.api);
+    await userEvent.type(screen.getByLabelText("Reviewer name"), "vinay");
+    const cards = await screen.findAllByRole("article");
+    const deploy = cards.find((c) => within(c).queryByText("deploy"))!;
+    const arg = within(deploy).getByLabelText("argument target");
+    expect(arg).toHaveValue("the billing service to staging");
+    expect(within(deploy).queryByRole("button", { name: "Approve with edits" })).toBeNull();
+    await userEvent.clear(arg);
+    await userEvent.type(arg, "the billing service to dev");
+    expect(within(deploy).getByText(/was: the billing service to staging/)).toBeInTheDocument();
+    await userEvent.click(within(deploy).getByRole("button", { name: "Approve with edits" }));
+    await waitFor(() => expect(screen.getAllByRole("article")).toHaveLength(2));
+    expect(screen.getByRole("region", { name: "recent decisions" })).toHaveTextContent("edited → succeeded");
+    const log = await screen.findByRole("region", { name: "decision log" });
+    await waitFor(() => expect(log).toHaveTextContent('{"target":"the billing service to dev"}'));
+    expect(log).toHaveTextContent("edited");
+    const run = (await ctx.api.runtime.listRuns()).find((r) => r.task.startsWith("Deploy the billing"))!;
+    const view = await ctx.api.runtime.getRun(run.run_id);
+    expect(view.action?.args).toEqual({ target: "the billing service to dev" });
+    expect(view.result).toContain('simulated deploy executed with {"target": "the billing service to dev"}');
+  });
+
+  it("refuses a stale card when the pending record changed underneath it", async () => {
+    await freshRuntime();
+    await renderWithRuns(<ApprovalInbox />, ctx.api);
+    await userEvent.type(screen.getByLabelText("Reviewer name"), "vinay");
+    const [card] = await screen.findAllByRole("article");
+    const id = (await ctx.api.runtime.listRuns("waiting_approval"))[0].run_id;
+    const internal = ctx.api.runtime as unknown as { runs: Map<string, { st: { pending: { pending_id: string } } }> };
+    internal.runs.get(id)!.st.pending.pending_id = "re-issued";
+    await userEvent.click(within(card).getByRole("button", { name: "Approve" }));
+    expect(await within(card).findByRole("alert")).toHaveTextContent("409: pending_id does not match");
+  });
+
+  it("sends the reviewer token instead of a name when one is entered", async () => {
+    ctx.api.runtime = new MockRuntime({ reviewerTokens: { "tok-vinay": "vinay" } });
+    await ctx.api.runtime.startRun({ user_id: "u", task: "refund order 9", run_id: "tok-run" });
+    await renderWithRuns(<ApprovalInbox />, ctx.api);
+    await userEvent.type(screen.getByLabelText("Reviewer token"), "tok-vinay");
+    const [card] = await screen.findAllByRole("article");
+    await userEvent.click(within(card).getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(screen.queryAllByRole("article")).toHaveLength(0));
+    expect((await ctx.api.runtime.getRun("tok-run")).approval?.reviewer).toBe("vinay");
+    expect(sessionStorage.getItem("reviewer-token")).toBe("tok-vinay");
+    expect(localStorage.getItem("reviewer-token")).toBeNull();
   });
 });

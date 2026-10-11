@@ -17,6 +17,7 @@ cleanup() { for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
 AGENTRT_PERSISTENCE=memory AGENTRT_APPROVER_TOKEN=dev-approver \
+  AGENTRT_REVIEWER_TOKENS='{"tok-integration":"integration-bot"}' \
   "$RUNTIME_PY" -m uvicorn agent_runtime.api:create_app --factory --port "$RT_PORT" >"$LOG/runtime.log" 2>&1 & pids+=($!)
 "$HUB_PY" -m mcp_hub.cli sandbox --port "$SB_PORT" >"$LOG/sandbox.log" 2>&1 & pids+=($!)
 MCP_HUB_PUBLIC_URL="http://127.0.0.1:$HUB_PORT" MCP_HUB_SANDBOX_URL="http://127.0.0.1:$SB_PORT" \
@@ -28,6 +29,6 @@ for url in "http://127.0.0.1:$RT_PORT/healthz" "http://127.0.0.1:$HUB_PORT/healt
   curl -fsS "$url" >/dev/null || { echo "not up: $url"; tail -n 50 "$LOG"/*.log; exit 1; }
 done
 
-AGENT_RUNTIME_URL="http://127.0.0.1:$RT_PORT" AGENT_RUNTIME_APPROVER_TOKEN=dev-approver \
+AGENT_RUNTIME_URL="http://127.0.0.1:$RT_PORT" AGENT_RUNTIME_APPROVER_TOKEN=dev-approver REVIEWER_TOKEN=tok-integration \
 MCP_HUB_URL="http://127.0.0.1:$HUB_PORT" \
   npx vitest run --project integration

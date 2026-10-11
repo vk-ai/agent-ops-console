@@ -65,14 +65,17 @@ npm run dev
 | | |
 |---|---|
 | `npm run lint` / `npm run typecheck` | ESLint (next config, zero warnings) / `next typegen && tsc` |
-| `npm test` | Vitest: 64 unit and component tests, offline. The 14 live tests are skipped unless backend URLs are set. |
+| `npm test` | Vitest: 72 unit and component tests, offline. The 15 live tests are skipped unless backend URLs are set. |
 | `npm run test:e2e` | Playwright smoke test against a production build in mock mode (`npm run build` first) |
 | `npm run test:integration` | Starts both backends from Python and runs the live tests (`RUNTIME_PY`, `HUB_PY` point at venvs) |
 | `npm run screenshots` | Regenerates `docs/screenshots` |
 
 CI (`.github/workflows/ci.yml`) runs two jobs. The first runs lint, typecheck, Vitest, build and the
 Playwright smoke test. The second pip-installs both backends from their public repos and runs the live
-integration tests against them.
+integration tests against them. **For now it installs agent-runtime-gcp from the
+`feat/edit-args-approval` branch** (`RUNTIME_REF` in the workflow), because the edit-args API is in
+vk-ai/agent-runtime-gcp#1. Switch `RUNTIME_REF` back to `main` when that PR merges; if the branch is deleted
+first, this job will fail at install.
 
 ## How it fits together
 
@@ -92,7 +95,7 @@ backends' actual responses: `RunRecord`, `RunManager.view()`, the memory items, 
 | Feature | Backend API used | Notes |
 |---|---|---|
 | Run list and timeline | `GET /runs`, `GET /runs/{id}` | The runtime records which nodes finished (`steps`), the current node, `next`, and created/heartbeat/finished times, but no per-node timestamps. The timeline is derived from those fields and doesn't invent timings. |
-| Approval inbox | `GET /runs?status=waiting_approval`, `POST /runs/{id}/decision` | Approve/reject with reviewer and comment. A run decided elsewhere shows the backend's 409. |
+| Approval inbox | `GET /runs?status=waiting_approval`, `POST /runs/{id}/decision`, `GET /decisions` | Approve, reject, or **edit the action's arguments and approve** ("Approve with edits"). The decision is bound to the `pending_id` and `args_digest` shown on the card, so the runtime returns 409 if they changed. The card shows the digest and its expiry. An optional **per-reviewer token** (kept in `sessionStorage` and forwarded as `X-Approver-Token`) replaces the shared token, and the runtime then attributes the decision to that token's reviewer. A **decision log** table shows who decided what and when, with original vs edited args. With runtimes older than edit-args approvals, the card falls back to plain approve/reject. |
 | Resume | `POST /runs/{id}/resume` | Offered for failed runs that still have nodes left. |
 | Memory viewer | `GET /users/{id}/memories` | Read-only, because the runtime has no edit or delete endpoint. |
 | Tool permissions | hub `policy.json` (file) | Shows the role × tool matrix with inherited grants, inheritance edits, rate limits and argument rules. A TypeScript port of `PolicyEngine` validates edits and simulates decisions. |
@@ -115,7 +118,10 @@ they are not true push from the runtime.
   route, the typed browser client, and the Vitest + React Testing Library + MSW tests
 - The Playwright smoke test, which runs against a production build
 - The live check against agent-runtime-gcp: start a risky run, see it wait, approve it, get a 409 on a
-  second decision and a 401 without the approver token, read the saved memory. On 2026-10-09 it ran
+  second decision and a 401 without the approver token, read the saved memory. Edit-args approval:
+  a stale digest gives 409, an invalid edit gives 422, an edit through a per-reviewer token is attributed to
+  that reviewer, a replay gives 409, and the edit shows up in the decision log; the mock's digest matches the
+  runtime's. On 2026-10-09 it ran
   against the runtime started locally, and CI runs it on every push.
 - The live check against mcp-integration-hub: agent card, connections, audit verify, and 403/401 for
   the wrong key or no key
@@ -139,8 +145,14 @@ they are not true push from the runtime.
   the console's memory and are lost on restart. The console's validation is a bit stricter than the
   hub's (it also checks regexes and rate-limit numbers). The simulator's rate-limit counter starts fresh
   on each check.
-- **The console has no auth.** Anyone who can reach it can approve runs as any reviewer name. The approver
-  token is a single shared secret on the server, so individual reviewers are not authenticated.
+- **The console has no login, and reviewer tokens aren't SSO.** Per-reviewer tokens are static secrets
+  that the runtime reads from `AGENTRT_REVIEWER_TOKENS`. The reviewer pastes theirs into the inbox, and the
+  console forwards it without storing it server-side. Without a token, the console falls back to the
+  shared server-side approver token plus a typed reviewer name, which anyone who can reach the console can
+  use as any name. There's no rotation, no roles, and no audit of who opened the console.
+- **Argument editing is as simple as the runtime's arguments.** Actions have one `target` string, every
+  value is edited as text (numbers are converted back only if the original was a number), and the editor
+  doesn't refresh if the pending record changes while the card is open (the runtime's 409 catches that).
 - **No hub audit log view.** The hub only exposes `/audit/verify` (chain intact + count), not the entries.
   OAuth connect/disconnect and running tools from the UI are not implemented.
 - Memories are read-only and only listed per user. The runtime offers no search or delete.
