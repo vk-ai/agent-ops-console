@@ -9,6 +9,7 @@ import type {
   AuditVerify,
   Connection,
   ConsoleConfig,
+  DecisionLogEntry,
   DecisionRequest,
   Memory,
   MetricsSummary,
@@ -40,12 +41,15 @@ export class ApiClient {
     private fetchImpl: typeof fetch = (...a) => fetch(...a),
   ) {}
 
-  private async req<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async req<T>(method: string, path: string, body?: unknown, extra: Record<string, string> = {}): Promise<T> {
     const url =
       this.base || typeof window === "undefined" ? `${this.base}${path}` : new URL(path, window.location.origin).toString();
     const res = await this.fetchImpl(url, {
       method,
-      headers: body === undefined ? { accept: "application/json" } : { "content-type": "application/json", accept: "application/json" },
+      headers: {
+        ...(body === undefined ? { accept: "application/json" } : { "content-type": "application/json", accept: "application/json" }),
+        ...extra,
+      },
       body: body === undefined ? undefined : JSON.stringify(body),
       cache: "no-store",
     });
@@ -70,8 +74,12 @@ export class ApiClient {
     this.req<RunRecord[]>("GET", `/api/runtime/runs${status ? `?status=${status}` : ""}`);
   getRun = (id: string) => this.req<RunView>("GET", `/api/runtime/runs/${encodeURIComponent(id)}`);
   startRun = (body: StartRunRequest) => this.req<RunView>("POST", "/api/runtime/runs", body);
-  decide = (id: string, body: DecisionRequest) =>
-    this.req<RunView>("POST", `/api/runtime/runs/${encodeURIComponent(id)}/decision`, body);
+  /** `reviewerToken`: the reviewer's own token, forwarded by the BFF to the runtime (never stored server-side). */
+  decide = (id: string, body: DecisionRequest, reviewerToken?: string) =>
+    this.req<RunView>("POST", `/api/runtime/runs/${encodeURIComponent(id)}/decision`, body,
+      reviewerToken ? { "x-reviewer-token": reviewerToken } : {});
+  decisions = (runId?: string) =>
+    this.req<DecisionLogEntry[]>("GET", `/api/runtime/decisions${runId ? `?run_id=${encodeURIComponent(runId)}` : ""}`);
   resume = (id: string) => this.req<RunView>("POST", `/api/runtime/runs/${encodeURIComponent(id)}/resume`);
   memories = (userId: string) =>
     this.req<Memory[]>("GET", `/api/runtime/users/${encodeURIComponent(userId)}/memories`);

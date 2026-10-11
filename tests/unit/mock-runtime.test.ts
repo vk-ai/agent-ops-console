@@ -1,19 +1,24 @@
 // The mock runtime must behave like agent-runtime-gcp; compare against captured real responses.
 import { describe, expect, it } from "vitest";
 import approved from "../fixtures/run-approved.json";
+import edited from "../fixtures/run-edited.json";
+import editedLog from "../fixtures/decisions-run-edited.json";
 import failed from "../fixtures/run-failed.json";
 import memU2 from "../fixtures/memories-u2.json";
 import plain from "../fixtures/run-plain.json";
 import rejected from "../fixtures/run-rejected.json";
 import waiting from "../fixtures/run-waiting.json";
 import { UpstreamError } from "@/lib/server/errors";
-import { detectAction, extractMemories, MockRuntime, uuid5Url } from "@/lib/server/mock-runtime";
+import { argsDigest, detectAction, extractMemories, MockRuntime, pyJson, uuid5Url } from "@/lib/server/mock-runtime";
 import type { RunView } from "@/lib/types";
 
 const VOLATILE = ["owner", "created_at", "heartbeat_at", "finished_at"] as const;
 function comparable(v: RunView | object) {
   const c: Record<string, unknown> = { ...(v as Record<string, unknown>) };
   for (const k of VOLATILE) c[k] = c[k] === null ? null : "<t>";
+  // pending ids and their timestamps are random/clock-based on both sides
+  if (c.pending_decision) c.pending_decision = { ...(c.pending_decision as object), pending_id: "<id>", created_at: "<t>", expires_at: "<t>" };
+  if (c.approval && (c.approval as { pending_id?: string }).pending_id) c.approval = { ...(c.approval as object), pending_id: "<id>" };
   return c;
 }
 
@@ -93,5 +98,48 @@ describe("graph.py helpers", () => {
   });
   it("uuid5 matches Python uuid.uuid5(NAMESPACE_URL, ...)", () => {
     expect(uuid5Url("u1:i prefer python")).toBe("650e6319-8948-5d11-9039-f1bb251bac24");
+  });
+});
+
+describe("MockRuntime edit-args approvals (parity with agent-runtime-gcp approvals.py)", () => {
+  it("computes the same args digest and Python json.dumps text as the runtime", () => {
+    expect(argsDigest({ type: "deploy", args: { target: "build 7 to prod" } })).toBe(edited.approval.original_args_digest);
+    expect(argsDigest(edited.action)).toBe(edited.approval.approved_args_digest);
+    expect(pyJson({ b: 1, a: "é" })).toBe('{"a": "\\u00e9", "b": 1}');
+    expect(detectAction("Deploy build 7 to prod.")?.args).toEqual({ target: "build 7 to prod" });
+  });
+
+  it("a pending record binds the decision; edit matches the captured real response and log", async () => {
+    const rt = new MockRuntime();
+    const w = await rt.startRun({ user_id: "u1", task: "Deploy build 7 to prod", run_id: "run-edited" });
+    const pd = w.pending_decision!;
+    expect(pd.args).toEqual({ target: "build 7 to prod" });
+    expect(pd.args_digest).toBe(edited.approval.original_args_digest);
+    await expect(rt.decide("run-edited", { decision: "approve", reviewer: "v", pending_id: "stale" })).rejects.toMatchObject({ status: 409 });
+    await expect(rt.decide("run-edited", { decision: "approve", reviewer: "v", args_digest: "sha256:0" })).rejects.toMatchObject({ status: 409 });
+    await expect(rt.decide("run-edited", { decision: "edit", reviewer: "v", edited_args: { evil: 1 } })).rejects.toMatchObject({ status: 422 });
+    const v = await rt.decide("run-edited", {
+      decision: "edit", reviewer: "vinay", comment: "prod is frozen", pending_id: pd.pending_id, args_digest: pd.args_digest,
+      edited_args: { target: "build 7 to staging" },
+    });
+    expect(comparable(v)).toEqual(comparable(edited));
+    const log = await rt.decisions("run-edited");
+    const strip = (e: object) => ({ ...e, pending_id: "<id>", decided_at: "<t>" });
+    expect(log.map(strip)).toEqual(editedLog.map(strip));
+    await expect(rt.decide("run-edited", { decision: "approve", reviewer: "v", pending_id: pd.pending_id })).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("expires pending approvals and enforces per-reviewer tokens", async () => {
+    let t = 1000;
+    const rt = new MockRuntime({ clock: () => t, approvalTtlS: 60, reviewerTokens: { "tok-a": "alice" } });
+    await rt.startRun({ user_id: "u", task: "pay invoice 7", run_id: "p" });
+    await expect(rt.decide("p", { approved: true, reviewer: "x" })).rejects.toMatchObject({ status: 401 });
+    await expect(rt.decide("p", { approved: true, reviewer: "bob" }, "tok-a")).rejects.toMatchObject({ status: 403 });
+    t += 61;
+    await expect(rt.decide("p", { approved: true }, "tok-a")).rejects.toMatchObject({ status: 410 });
+    const v = await rt.getRun("p");
+    expect(v.status).toBe("rejected");
+    expect(v.approval?.decision).toBe("expired");
+    expect((await rt.decisions())[0]).toMatchObject({ decision: "expired", reviewer: "system" });
   });
 });

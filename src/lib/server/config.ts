@@ -7,6 +7,8 @@
  *   MCP_HUB_API_KEY              sent as X-API-Key (admin key needed for /audit/verify)
  *   HUB_POLICY_FILE              path to mcp_hub/config/policy.json to edit; unset -> in-memory copy
  *   OPS_CONSOLE_MOCK=1           force mock mode for everything
+ *   MOCK_REVIEWER_TOKENS         mock runtime: JSON {token: reviewer}, like the runtime's AGENTRT_REVIEWER_TOKENS
+ *   MOCK_APPROVAL_TTL_S          mock runtime: pending approval expiry (default 3600, 0 = never)
  *   MOCK_STEP_MS                 mock runtime: advance one node per N ms (0 = synchronous like the real API)
  *   STREAM_POLL_MS               how often /api/stream/runs polls the runtime (default 1500)
  */
@@ -35,7 +37,11 @@ function build(env: NodeJS.ProcessEnv): Backends {
   if (!forceMock && env.AGENT_RUNTIME_URL) {
     runtime = new HttpRuntime(env.AGENT_RUNTIME_URL, env.AGENT_RUNTIME_APPROVER_TOKEN);
   } else {
-    const mock = new MockRuntime({ stepMs: Number(env.MOCK_STEP_MS ?? 0) });
+    const mock = new MockRuntime({
+      stepMs: Number(env.MOCK_STEP_MS ?? 0),
+      reviewerTokens: env.MOCK_REVIEWER_TOKENS ? JSON.parse(env.MOCK_REVIEWER_TOKENS) : undefined,
+      approvalTtlS: env.MOCK_APPROVAL_TTL_S ? Number(env.MOCK_APPROVAL_TTL_S) : undefined,
+    });
     ready = mock.seed();
     runtime = mock;
   }

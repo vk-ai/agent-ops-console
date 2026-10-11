@@ -12,7 +12,9 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import type {
+  DecisionLogEntry,
   DecisionRequest,
+  PendingDecision,
   Memory,
   MetricsSummary,
   RunRecord,
@@ -33,8 +35,9 @@ interface State {
   provider: string | null;
   cost: number;
   tokens: number;
-  action: { type: string; description: string } | null;
-  approval: { approved: boolean; reviewer: string; comment: string } | null;
+  action: ProposedActionM | null;
+  approval: RunView["approval"];
+  pending: (PendingDecision & { status: string }) | null;
   actionResult: string | null;
   result: string | null;
   outcome: RunStatus | null;
@@ -42,12 +45,35 @@ interface State {
   next: string[];
 }
 
-export function detectAction(task: string) {
+type ProposedActionM = { type: string; description: string; args: Record<string, unknown>; original_args?: Record<string, unknown> };
+
+export function detectAction(task: string): ProposedActionM | null {
   const lowered = task.toLowerCase();
   for (const kw of RISKY_ACTIONS) {
-    if (new RegExp(`\\b${kw}\\b`).test(lowered)) return { type: kw, description: task.trim().slice(0, 200) };
+    if (new RegExp(`\\b${kw}\\b`).test(lowered)) {
+      // graph.py: re.search(rf"\b{kw}\b\s*(.*)", task.strip(), re.I | re.S) -> strip().rstrip(".")[:200]
+      const m = new RegExp(`\\b${kw}\\b\\s*([\\s\\S]*)`, "i").exec(task.trim());
+      const target = (m ? m[1] : "").trim().replace(/\.+$/, "").slice(0, 200);
+      return { type: kw, description: task.trim().slice(0, 200), args: { target } };
+    }
   }
   return null;
+}
+
+const asciiOnly = (s: string) => s.replace(/[\u0080-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+
+/** Python `json.dumps(v, sort_keys=True, separators=...)` (ensure_ascii) for plain JSON values. */
+export function pyJson(v: unknown, sep: [string, string] = [", ", ": "]): string {
+  if (v === null || typeof v !== "object") return asciiOnly(JSON.stringify(v));
+  if (Array.isArray(v)) return `[${v.map((x) => pyJson(x, sep)).join(sep[0])}]`;
+  const o = v as Record<string, unknown>;
+  return `{${Object.keys(o).sort().map((k) => `${asciiOnly(JSON.stringify(k))}${sep[1]}${pyJson(o[k], sep)}`).join(sep[0])}}`;
+}
+
+/** approvals.args_digest: sha256 over the canonical JSON of {type, args}. */
+export function argsDigest(action: { type: string; args?: Record<string, unknown> } | null): string {
+  const body = { type: action?.type ?? null, args: action?.args ?? {} };
+  return "sha256:" + createHash("sha256").update(pyJson(body, [",", ":"])).digest("hex");
 }
 
 export function extractMemories(task: string): string[] {
@@ -74,8 +100,17 @@ export class MockRuntime implements RuntimeBackend {
   private busy = new Set<string>();
   private readonly instance = `mock-${randomUUID().slice(0, 6)}`;
 
+  private log: DecisionLogEntry[] = [];
+
   constructor(
-    private opts: { stepMs?: number; clock?: () => number } = {},
+    private opts: {
+      stepMs?: number;
+      clock?: () => number;
+      /** Pending approvals expire after this many seconds (0 = never), like AGENTRT_APPROVAL_TTL_S. */
+      approvalTtlS?: number;
+      /** {token: reviewer}, like AGENTRT_REVIEWER_TOKENS. */
+      reviewerTokens?: Record<string, string>;
+    } = {},
   ) {}
 
   private now() {
@@ -109,7 +144,7 @@ export class MockRuntime implements RuntimeBackend {
         provider: null, error: null,
       },
       st: {
-        memories: [], plan: null, provider: null, cost: 0, tokens: 0, action: null, approval: null,
+        memories: [], plan: null, provider: null, cost: 0, tokens: 0, action: null, approval: null, pending: null,
         actionResult: null, result: null, outcome: null, steps: [], next: ["recall_memory"],
       },
     };
@@ -117,16 +152,81 @@ export class MockRuntime implements RuntimeBackend {
     return this.drive(runId);
   }
 
-  async decide(runId: string, req: DecisionRequest): Promise<RunView> {
+  /** Same rules as service.RunManager.decide + api.py's guard (see agent-runtime-gcp approvals.py). */
+  async decide(runId: string, req: DecisionRequest, reviewerToken?: string): Promise<RunView> {
+    let reviewer = req.reviewer?.trim() ?? "";
+    const tokens = this.opts.reviewerTokens ?? {};
+    if (reviewerToken !== undefined || Object.keys(tokens).length > 0) {
+      const owner = reviewerToken ? tokens[reviewerToken] : undefined;
+      if (!owner) throw new UpstreamError(401, "invalid or missing X-Approver-Token");
+      if (reviewer && reviewer !== owner) throw new UpstreamError(403, `token belongs to '${owner}', not '${reviewer}'`);
+      reviewer = owner;
+    }
+    if (!reviewer) throw new UpstreamError(422, "reviewer is required (or use a per-reviewer token)");
+    const kind = req.decision ?? (typeof req.approved === "boolean" ? (req.approved ? "approve" : "reject") : undefined);
+    if (!kind) throw new UpstreamError(422, "pass 'decision' (approve|reject|edit) or 'approved'");
+    if (kind === "edit" && !req.edited_args) throw new UpstreamError(422, "decision 'edit' needs edited_args");
     const e = this.get(runId);
     if (e.rec.status !== "waiting_approval") {
       throw new UpstreamError(409, `run ${runId} is ${e.rec.status}, not waiting_approval`);
     }
-    if (typeof req.approved !== "boolean" || !req.reviewer) throw new UpstreamError(422, "approved and reviewer are required");
+    const p = e.st.pending!;
+    if (req.pending_id !== undefined && req.pending_id !== p.pending_id) {
+      throw new UpstreamError(409, "pending_id does not match the current pending approval");
+    }
+    if (req.args_digest !== undefined && req.args_digest !== p.args_digest) {
+      throw new UpstreamError(409, "args_digest does not match: the action's arguments changed since they were reviewed");
+    }
+    const action = e.st.action!;
+    const now = this.now();
+    const entry: DecisionLogEntry = {
+      run_id: runId, pending_id: p.pending_id, user_id: e.rec.user_id, action_type: action.type, reviewer,
+      comment: req.comment ?? "", decided_at: now, decision: "approved", original_args: { ...action.args },
+      original_args_digest: p.args_digest,
+    };
+    if (p.expires_at !== null && now > p.expires_at) {
+      p.status = "expired";
+      this.log.push({ ...entry, decision: "expired", reviewer: "system", comment: `decision by '${reviewer}' arrived after expiry` });
+      e.st.approval = { approved: false, reviewer: "system", comment: "approval expired", decision: "expired", pending_id: p.pending_id };
+      e.rec.status = "running";
+      await this.drive(runId);
+      throw new UpstreamError(410, `pending approval ${p.pending_id} expired; the run was rejected`);
+    }
+    const approval: NonNullable<RunView["approval"]> = {
+      approved: kind !== "reject", reviewer, comment: req.comment ?? "", decision: kind, pending_id: p.pending_id,
+      original_args_digest: p.args_digest,
+    };
+    if (kind === "edit") {
+      const edited = req.edited_args;
+      if (!edited || typeof edited !== "object" || Object.keys(edited).length === 0) {
+        throw new UpstreamError(422, "edited_args must be a non-empty object");
+      }
+      const extra = Object.keys(edited).filter((k) => !(k in action.args)).sort();
+      if (extra.length) throw new UpstreamError(422, `edited_args may only change existing arguments; unknown: ${JSON.stringify(extra)}`);
+      const bad = Object.keys(edited).filter((k) => !["string", "number", "boolean"].includes(typeof edited[k])).sort();
+      if (bad.length) throw new UpstreamError(422, `edited_args values must be strings, numbers or booleans: ${JSON.stringify(bad)}`);
+      const args = { ...action.args, ...edited };
+      e.st.action = { ...action, args, original_args: { ...action.args } };
+      approval.approved_args_digest = entry.approved_args_digest = argsDigest(e.st.action);
+      entry.edited_args = args;
+    } else if (kind === "approve") {
+      approval.approved_args_digest = entry.approved_args_digest = p.args_digest;
+    }
+    p.status = { approve: "approved", reject: "rejected", edit: "edited" }[kind];
+    this.log.push({ ...entry, decision: p.status as DecisionLogEntry["decision"] });
     e.rec.status = "running";
-    e.rec.heartbeat_at = this.now();
-    e.st.approval = { approved: req.approved, reviewer: req.reviewer, comment: req.comment ?? "" };
+    e.rec.heartbeat_at = now;
+    e.st.approval = approval;
     return this.drive(runId);
+  }
+
+  async decisions(runId?: string, limit = 100): Promise<DecisionLogEntry[]> {
+    if (runId) this.get(runId);
+    return this.log
+      .filter((d) => !runId || d.run_id === runId)
+      .sort((a, b) => b.decided_at - a.decided_at)
+      .slice(0, limit)
+      .map((d) => ({ ...d }));
   }
 
   async resume(runId: string): Promise<RunView> {
@@ -161,8 +261,13 @@ export class MockRuntime implements RuntimeBackend {
       rec.status === "waiting_approval" && st.action
         ? { run_id: rec.run_id, action: { ...st.action }, plan: st.plan }
         : null;
+    const pd = st.pending && st.pending.status === "pending" && pending ? st.pending : null;
     return {
-      ...rec, next: [...st.next], pending_approval: pending, result: st.result, plan: st.plan,
+      ...rec, next: [...st.next], pending_approval: pending,
+      pending_decision: pending
+        ? pd && { pending_id: pd.pending_id, args_digest: pd.args_digest, created_at: pd.created_at, expires_at: pd.expires_at, args: { ...pd.args } }
+        : null,
+      result: st.result, plan: st.plan,
       action: st.action ? { ...st.action } : null, approval: st.approval ? { ...st.approval } : null,
       steps: [...st.steps], memories_used: [...st.memories], tokens: st.tokens,
     };
@@ -186,6 +291,13 @@ export class MockRuntime implements RuntimeBackend {
       const node = e.st.next[0];
       if (node === "human_approval" && !e.st.approval) {
         e.rec.status = "waiting_approval";
+        if (!e.st.pending || e.st.pending.status !== "pending") {
+          const t = this.now(), ttl = this.opts.approvalTtlS ?? 3600;
+          e.st.pending = {
+            pending_id: randomUUID().replace(/-/g, ""), args_digest: argsDigest(e.st.action), args: { ...e.st.action!.args },
+            created_at: t, expires_at: ttl > 0 ? t + ttl : null, status: "pending",
+          };
+        }
         e.rec.current_node = node;
         e.rec.heartbeat_at = this.now();
         return;
@@ -235,7 +347,8 @@ export class MockRuntime implements RuntimeBackend {
       case "human_approval":
         return [st.approval?.approved ? "execute_action" : "save_memory"];
       case "execute_action":
-        st.actionResult = `simulated ${st.action!.type} executed`;
+        st.actionResult = `simulated ${st.action!.type} executed` +
+          (Object.keys(st.action!.args).length ? ` with ${pyJson(st.action!.args)}` : "");
         return ["save_memory"];
       case "save_memory": {
         const bucket = this.mem.get(rec.user_id) ?? new Map<string, Memory>();

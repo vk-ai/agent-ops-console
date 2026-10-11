@@ -1,5 +1,6 @@
 /** Server-side client for agent-runtime-gcp (src/agent_runtime/api.py). */
 import type {
+  DecisionLogEntry,
   DecisionRequest,
   Memory,
   MetricsSummary,
@@ -17,7 +18,9 @@ export interface RuntimeBackend {
   listRuns(status?: RunStatus): Promise<RunRecord[]>;
   getRun(runId: string): Promise<RunView>;
   startRun(req: StartRunRequest): Promise<RunView>;
-  decide(runId: string, req: DecisionRequest): Promise<RunView>;
+  /** `reviewerToken` (a per-reviewer token typed by the reviewer) replaces the shared approver token. */
+  decide(runId: string, req: DecisionRequest, reviewerToken?: string): Promise<RunView>;
+  decisions(runId?: string, limit?: number): Promise<DecisionLogEntry[]>;
   resume(runId: string): Promise<RunView>;
   memories(userId: string): Promise<Memory[]>;
   metrics(): Promise<MetricsSummary>;
@@ -69,9 +72,20 @@ export class HttpRuntime implements RuntimeBackend {
   startRun(req: StartRunRequest) {
     return this.req<RunView>("POST", "/runs", req);
   }
-  decide(runId: string, req: DecisionRequest) {
-    const headers: Record<string, string> = this.approverToken ? { "x-approver-token": this.approverToken } : {};
+  decide(runId: string, req: DecisionRequest, reviewerToken?: string) {
+    const token = reviewerToken || this.approverToken;
+    const headers: Record<string, string> = token ? { "x-approver-token": token } : {};
     return this.req<RunView>("POST", `/runs/${encodeURIComponent(runId)}/decision`, { comment: "", ...req }, headers);
+  }
+  /** Decision log. Runtimes from before edit-args approvals have no such route: an empty log, not an error. */
+  async decisions(runId?: string, limit = 100) {
+    const path = runId ? `/runs/${encodeURIComponent(runId)}/decisions` : `/decisions?limit=${limit}`;
+    try {
+      return await this.req<DecisionLogEntry[]>("GET", path);
+    } catch (e) {
+      if (!runId && e instanceof UpstreamError && e.status === 404) return [];
+      throw e;
+    }
   }
   resume(runId: string) {
     return this.req<RunView>("POST", `/runs/${encodeURIComponent(runId)}/resume`);

@@ -30,6 +30,18 @@ describe("HttpRuntime", () => {
     expect(JSON.parse(fetchMock.mock.calls[2][1]!.body as string)).toEqual({ comment: "", approved: true, reviewer: "v" });
   });
 
+  it("a reviewer's own token replaces the shared one; decisions() tolerates older runtimes", async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (url) =>
+      String(url).endsWith("/decisions?limit=100") ? json({ detail: "Not Found" }, 404) : json(waiting));
+    const rt = new HttpRuntime("http://rt", "shared", fetchMock);
+    await rt.decide("r1", { decision: "approve", pending_id: "p", args_digest: "sha256:x" }, "tok-alice");
+    expect((fetchMock.mock.calls[0][1]!.headers as Record<string, string>)["x-approver-token"]).toBe("tok-alice");
+    expect(JSON.parse(fetchMock.mock.calls[0][1]!.body as string)).toEqual({ comment: "", decision: "approve", pending_id: "p", args_digest: "sha256:x" });
+    expect(await rt.decisions()).toEqual([]);
+    await rt.decisions("r 1");
+    expect(fetchMock.mock.calls[2][0]).toBe("http://rt/runs/r%201/decisions");
+  });
+
   it("maps FastAPI errors and network failures", async () => {
     const rt409 = new HttpRuntime("http://rt", undefined, (async () => json({ detail: "run x is succeeded, not waiting_approval" }, 409)) as typeof fetch);
     await expect(rt409.decide("x", { approved: true, reviewer: "v" })).rejects.toMatchObject({ status: 409, detail: "run x is succeeded, not waiting_approval" });

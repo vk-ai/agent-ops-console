@@ -39,6 +39,10 @@ export interface RunRecord {
 export interface ProposedAction {
   type: string;
   description: string;
+  /** Arguments the action will execute with (agent-runtime-gcp >= edit-args approvals). */
+  args?: Record<string, unknown>;
+  /** Present after an edit: the arguments originally proposed. */
+  original_args?: Record<string, unknown>;
 }
 
 /** Payload passed to `langgraph.types.interrupt` in the `human_approval` node. */
@@ -52,12 +56,46 @@ export interface ApprovalDecision {
   approved: boolean;
   reviewer: string;
   comment: string;
+  /** approve | reject | edit | expired (newer runtimes only). */
+  decision?: string;
+  pending_id?: string;
+  original_args_digest?: string;
+  approved_args_digest?: string;
+}
+
+/** `pending_decision` in `GET /runs/{id}`: the single-use, expiring record a decision binds to. */
+export interface PendingDecision {
+  pending_id: string;
+  args_digest: string;
+  args: Record<string, unknown>;
+  created_at: number;
+  expires_at: number | null;
+}
+
+export type DecisionKind = "approve" | "reject" | "edit";
+
+/** Entry of `GET /decisions` / `GET /runs/{id}/decisions`. */
+export interface DecisionLogEntry {
+  run_id: string;
+  pending_id: string;
+  user_id: string;
+  action_type: string | null;
+  reviewer: string;
+  comment: string;
+  decided_at: number;
+  decision: "approved" | "rejected" | "edited" | "expired";
+  original_args: Record<string, unknown>;
+  original_args_digest: string;
+  edited_args?: Record<string, unknown>;
+  approved_args_digest?: string;
 }
 
 /** `RunManager.view()` (service.py): `GET /runs/{id}`, and the body of POST /runs, /decision, /resume. */
 export interface RunView extends RunRecord {
   next: string[];
   pending_approval: PendingApproval | null;
+  /** Missing on agent-runtime-gcp versions before edit-args approvals. */
+  pending_decision?: PendingDecision | null;
   result: string | null;
   plan: string | null;
   action: ProposedAction | null;
@@ -75,9 +113,15 @@ export interface StartRunRequest {
 
 /** `POST /runs/{id}/decision` body (api.py `Decision`). */
 export interface DecisionRequest {
-  approved: boolean;
-  reviewer: string;
+  /** Legacy form. */
+  approved?: boolean;
+  decision?: DecisionKind;
+  /** Optional when a per-reviewer token is used (the runtime takes the reviewer from the token). */
+  reviewer?: string;
   comment?: string;
+  pending_id?: string;
+  args_digest?: string;
+  edited_args?: Record<string, unknown>;
 }
 
 /** Item from `GET /users/{user_id}/memories`. */
